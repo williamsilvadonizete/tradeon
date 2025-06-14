@@ -1,5 +1,10 @@
+"""
+Módulo de análise técnica para trading
+"""
+
 import pandas as pd
 import numpy as np
+import ta
 from typing import Dict, Optional, Tuple
 from ..exchanges.order_manager import OrderManager, OrderConfig
 from ..risk.stop_loss_manager import StopLossManager, StopLossConfig
@@ -7,16 +12,27 @@ from .base import TradingStrategy
 import sys
 import os
 import logging
+from src.config.settings import (
+    RSI_PERIOD,
+    EMA_FAST,
+    EMA_SLOW,
+    MACD_FAST,
+    MACD_SLOW,
+    MACD_SIGNAL,
+    BB_PERIOD,
+    BB_STD,
+    MAX_POSITION_SIZE,
+    MIN_VOLUME,
+    MIN_VOLATILITY,
+    MAX_SPREAD
+)
 
 # Adiciona o diretório raiz ao path para importar configurações
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
-from config.settings import (
-    RSI_PERIOD, EMA_FAST, EMA_SLOW,
-    MACD_FAST, MACD_SLOW, MACD_SIGNAL,
-    BB_PERIOD, BB_STD, MAX_POSITION_SIZE
-)
 
 class TechnicalAnalysisStrategy(TradingStrategy):
+    """Estratégia de análise técnica"""
+    
     def __init__(self, order_manager: OrderManager, stop_loss_manager: StopLossManager):
         """
         Inicializa a estratégia de análise técnica.
@@ -60,106 +76,174 @@ class TechnicalAnalysisStrategy(TradingStrategy):
         
         return logger
         
-    def calculate_indicators(self, data: pd.DataFrame) -> pd.DataFrame:
+    def analyze_market_conditions(self, data: pd.DataFrame) -> Dict:
         """
-        Calcula indicadores técnicos.
+        Analisa condições gerais do mercado
         
         Args:
-            data: DataFrame com dados OHLCV
+            data: DataFrame com dados históricos
             
         Returns:
-            DataFrame com indicadores adicionados
+            Dict com condições de mercado
         """
-        # RSI
-        delta = data['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        data['rsi'] = 100 - (100 / (1 + rs))
-        
-        # EMAs
-        data['ema_9'] = data['close'].ewm(span=9, adjust=False).mean()
-        data['ema_21'] = data['close'].ewm(span=21, adjust=False).mean()
-        data['ema_50'] = data['close'].ewm(span=50, adjust=False).mean()
-        
-        # MACD
-        exp1 = data['close'].ewm(span=12, adjust=False).mean()
-        exp2 = data['close'].ewm(span=26, adjust=False).mean()
-        data['macd'] = exp1 - exp2
-        data['signal'] = data['macd'].ewm(span=9, adjust=False).mean()
-        
-        # Bollinger Bands
-        data['sma_20'] = data['close'].rolling(window=20).mean()
-        data['std_20'] = data['close'].rolling(window=20).std()
-        data['upper_band'] = data['sma_20'] + (data['std_20'] * 2)
-        data['lower_band'] = data['sma_20'] - (data['std_20'] * 2)
-        
-        return data
-        
-    def generate_signal(self, data: pd.DataFrame) -> Dict:
+        try:
+            # Calcula indicadores de tendência
+            ema_fast = ta.trend.ema_indicator(data['close'], EMA_FAST)
+            ema_slow = ta.trend.ema_indicator(data['close'], EMA_SLOW)
+            
+            # Calcula indicadores de momentum
+            rsi = ta.momentum.rsi(data['close'], RSI_PERIOD)
+            macd = ta.trend.MACD(
+                data['close'],
+                MACD_FAST,
+                MACD_SLOW,
+                MACD_SIGNAL
+            )
+            
+            # Calcula indicadores de volatilidade
+            bb = ta.volatility.BollingerBands(
+                data['close'],
+                BB_PERIOD,
+                BB_STD
+            )
+            
+            # Calcula volume médio
+            avg_volume = data['volume'].rolling(20).mean()
+            
+            # Calcula spread
+            spread = (data['high'] - data['low']) / data['low']
+            
+            # Determina tendência
+            trend = 'up' if ema_fast.iloc[-1] > ema_slow.iloc[-1] else 'down'
+            
+            # Determina força da tendência
+            trend_strength = abs(ema_fast.iloc[-1] - ema_slow.iloc[-1]) / ema_slow.iloc[-1]
+            
+            # Determina condições de mercado
+            market_conditions = {
+                'trend': trend,
+                'trend_strength': trend_strength,
+                'rsi': rsi.iloc[-1],
+                'macd': {
+                    'line': macd.macd().iloc[-1],
+                    'signal': macd.macd_signal().iloc[-1],
+                    'histogram': macd.macd_diff().iloc[-1]
+                },
+                'bollinger_bands': {
+                    'upper': bb.bollinger_hband().iloc[-1],
+                    'middle': bb.bollinger_mavg().iloc[-1],
+                    'lower': bb.bollinger_lband().iloc[-1]
+                },
+                'volume': {
+                    'current': data['volume'].iloc[-1],
+                    'average': avg_volume.iloc[-1]
+                },
+                'volatility': {
+                    'current': spread.iloc[-1],
+                    'average': spread.rolling(20).mean().iloc[-1]
+                }
+            }
+            
+            return market_conditions
+            
+        except Exception as e:
+            self.logger.error(f"Error analyzing market conditions: {str(e)}")
+            return {}
+            
+    def validate_trade_conditions(self, market_conditions: Dict) -> bool:
         """
-        Gera sinal de trading baseado nos indicadores.
+        Valida condições para execução de trade
         
         Args:
-            data: DataFrame com indicadores
+            market_conditions: Condições de mercado
             
         Returns:
-            Dicionário com sinal e informações adicionais
+            bool indicando se condições são válidas
         """
-        last_row = data.iloc[-1]
-        prev_row = data.iloc[-2]
+        try:
+            # Verifica volume
+            if market_conditions['volume']['current'] < MIN_VOLUME:
+                return False
+                
+            # Verifica volatilidade
+            if market_conditions['volatility']['current'] < MIN_VOLATILITY:
+                return False
+                
+            # Verifica spread
+            if market_conditions['volatility']['current'] > MAX_SPREAD:
+                return False
+                
+            # Verifica força da tendência
+            if market_conditions['trend_strength'] < 0.001:  # 0.1%
+                return False
+                
+            return True
+            
+        except Exception as e:
+            self.logger.error(f"Error validating trade conditions: {str(e)}")
+            return False
+            
+    def generate_signal(self, data: pd.DataFrame) -> Optional[Dict]:
+        """
+        Gera sinal de trading baseado em análise técnica
         
-        # Inicializa sinal
-        signal = {
-            'action': 'hold',
-            'confidence': 0.0,
-            'reason': []
-        }
-        
-        # Análise RSI
-        if last_row['rsi'] < 30:
-            signal['action'] = 'buy'
-            signal['confidence'] += 0.3
-            signal['reason'].append('RSI sobrevendido')
-        elif last_row['rsi'] > 70:
-            signal['action'] = 'sell'
-            signal['confidence'] += 0.3
-            signal['reason'].append('RSI sobrecomprado')
+        Args:
+            data: DataFrame com dados históricos
             
-        # Análise EMAs
-        if last_row['ema_9'] > last_row['ema_21'] and prev_row['ema_9'] <= prev_row['ema_21']:
-            signal['action'] = 'buy'
-            signal['confidence'] += 0.2
-            signal['reason'].append('Cruzamento de EMAs para cima')
-        elif last_row['ema_9'] < last_row['ema_21'] and prev_row['ema_9'] >= prev_row['ema_21']:
-            signal['action'] = 'sell'
-            signal['confidence'] += 0.2
-            signal['reason'].append('Cruzamento de EMAs para baixo')
+        Returns:
+            Dict com sinal de trading ou None
+        """
+        try:
+            # Analisa condições de mercado
+            market_conditions = self.analyze_market_conditions(data)
             
-        # Análise MACD
-        if last_row['macd'] > last_row['signal'] and prev_row['macd'] <= prev_row['signal']:
-            signal['action'] = 'buy'
-            signal['confidence'] += 0.2
-            signal['reason'].append('Cruzamento MACD para cima')
-        elif last_row['macd'] < last_row['signal'] and prev_row['macd'] >= prev_row['signal']:
-            signal['action'] = 'sell'
-            signal['confidence'] += 0.2
-            signal['reason'].append('Cruzamento MACD para baixo')
+            # Valida condições
+            if not self.validate_trade_conditions(market_conditions):
+                return None
+                
+            # Determina sinal
+            signal = None
+            confidence = 0.0
             
-        # Análise Bollinger Bands
-        if last_row['close'] < last_row['lower_band']:
-            signal['action'] = 'buy'
-            signal['confidence'] += 0.3
-            signal['reason'].append('Preço abaixo da banda inferior')
-        elif last_row['close'] > last_row['upper_band']:
-            signal['action'] = 'sell'
-            signal['confidence'] += 0.3
-            signal['reason'].append('Preço acima da banda superior')
+            # Condições para compra
+            if (market_conditions['trend'] == 'up' and
+                market_conditions['rsi'] < 70 and
+                market_conditions['macd']['histogram'] > 0 and
+                data['close'].iloc[-1] < market_conditions['bollinger_bands']['upper']):
+                
+                signal = 'buy'
+                confidence = min(
+                    market_conditions['trend_strength'] * 10,
+                    (70 - market_conditions['rsi']) / 70,
+                    market_conditions['macd']['histogram'] / market_conditions['bollinger_bands']['middle']
+                )
+                
+            # Condições para venda
+            elif (market_conditions['trend'] == 'down' and
+                  market_conditions['rsi'] > 30 and
+                  market_conditions['macd']['histogram'] < 0 and
+                  data['close'].iloc[-1] > market_conditions['bollinger_bands']['lower']):
+                
+                signal = 'sell'
+                confidence = min(
+                    market_conditions['trend_strength'] * 10,
+                    (market_conditions['rsi'] - 30) / 70,
+                    -market_conditions['macd']['histogram'] / market_conditions['bollinger_bands']['middle']
+                )
+                
+            if signal and confidence > 0.5:  # Mínimo 50% de confiança
+                return {
+                    'action': signal,
+                    'confidence': confidence,
+                    'price': data['close'].iloc[-1],
+                    'market_conditions': market_conditions
+                }
+                
+            return None
             
-        # Normaliza confiança
-        signal['confidence'] = min(signal['confidence'], 1.0)
-        
-        return signal
+        except Exception as e:
+            self.logger.error(f"Error generating signal: {str(e)}")
+            return None
         
     def initialize_futures_settings(self, symbol: str) -> None:
         """
@@ -326,4 +410,10 @@ class TechnicalAnalysisStrategy(TradingStrategy):
             
         except Exception as e:
             self.logger.error(f"Error executing trade for {symbol}: {str(e)}")
-            return None 
+            return None
+
+    def calculate_indicators(self, data: pd.DataFrame) -> dict:
+        """
+        Calcula e retorna os indicadores técnicos principais para o DataFrame fornecido.
+        """
+        return self.analyze_market_conditions(data) 

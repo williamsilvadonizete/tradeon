@@ -1,224 +1,145 @@
-import psycopg2
 import os
 import logging
-from datetime import datetime
+import asyncio
+from typing import Optional
+from datetime import datetime, timedelta
+import asyncpg
+from dotenv import load_dotenv
+from src.db.database import get_db_connection, execute_query
 
-# Configuração do logger
+# Load environment variables
+load_dotenv()
+
+# Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-def get_db_connection():
-    """
-    Estabelece conexão com o banco de dados PostgreSQL.
-    """
+async def create_tables() -> bool:
+    """Create database tables if they don't exist."""
     try:
-        conn = psycopg2.connect(
-            dbname=os.getenv("POSTGRES_DB", "trading_bot"),
-            user=os.getenv("POSTGRES_USER", "postgres"),
-            password=os.getenv("POSTGRES_PASSWORD", "postgres"),
-            host=os.getenv("POSTGRES_HOST", "localhost"),
-            port=os.getenv("POSTGRES_PORT", "5432")
-        )
-        return conn
+        logger.info("Starting database migration...")
+        
+        # Drop existing tables and functions
+        logger.info("Dropping existing tables and functions...")
+        await execute_query("""
+            DROP TABLE IF EXISTS worker_logs CASCADE;
+            DROP TABLE IF EXISTS trades CASCADE;
+            DROP TABLE IF EXISTS trade_stats CASCADE;
+            DROP FUNCTION IF EXISTS clean_old_logs() CASCADE;
+        """)
+        logger.info("✅ Existing tables and functions dropped")
+        
+        # Create worker_logs table
+        logger.info("Creating worker_logs table...")
+        await execute_query("""
+            CREATE TABLE worker_logs (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                symbol VARCHAR(20) NOT NULL,
+                exchange_id VARCHAR(50) NOT NULL,
+                analysis JSONB NOT NULL,
+                expires_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP + INTERVAL '7 days'
+            )
+        """)
+        logger.info("✅ worker_logs table created")
+        
+        # Create trades table
+        logger.info("Creating trades table...")
+        await execute_query("""
+            CREATE TABLE trades (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                symbol VARCHAR(20) NOT NULL,
+                exchange_id VARCHAR(50) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                price DECIMAL NOT NULL,
+                amount DECIMAL NOT NULL,
+                status VARCHAR(20) NOT NULL,
+                order_id VARCHAR(100),
+                analysis JSONB
+            )
+        """)
+        logger.info("✅ trades table created")
+        
+        # Create trade_stats table
+        logger.info("Creating trade_stats table...")
+        await execute_query("""
+            CREATE TABLE trade_stats (
+                id SERIAL PRIMARY KEY,
+                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                symbol VARCHAR(20) NOT NULL,
+                exchange_id VARCHAR(50) NOT NULL,
+                total_trades INTEGER DEFAULT 0,
+                winning_trades INTEGER DEFAULT 0,
+                losing_trades INTEGER DEFAULT 0,
+                total_profit DECIMAL DEFAULT 0,
+                win_rate DECIMAL DEFAULT 0,
+                average_profit DECIMAL DEFAULT 0,
+                last_updated TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        logger.info("✅ trade_stats table created")
+        
+        # Create function to clean old logs
+        logger.info("Creating clean_old_logs function...")
+        await execute_query("""
+            CREATE OR REPLACE FUNCTION clean_old_logs()
+            RETURNS trigger AS $$
+            BEGIN
+                DELETE FROM worker_logs WHERE expires_at < CURRENT_TIMESTAMP;
+                RETURN NEW;
+            END;
+            $$ LANGUAGE plpgsql;
+        """)
+        logger.info("✅ clean_old_logs function created")
+        
+        # Create trigger to clean old logs
+        logger.info("Creating clean_old_logs trigger...")
+        await execute_query("""
+            CREATE TRIGGER clean_old_logs_trigger
+            AFTER INSERT ON worker_logs
+            EXECUTE FUNCTION clean_old_logs();
+        """)
+        logger.info("✅ clean_old_logs trigger created")
+        
+        logger.info("✅ All tables and functions created successfully")
+        return True
+        
     except Exception as e:
-        logger.error(f"Database connection error: {str(e)}")
-        raise
+        logger.error(f"❌ Error creating tables: {str(e)}")
+        return False
 
-def create_tables():
-    """
-    Cria as tabelas necessárias no banco de dados.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
+async def run_migrations() -> bool:
+    """Run database migrations."""
+    max_attempts = 5
+    attempt = 1
     
-    try:
-        # Tabela de trades
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS trades (
-            id SERIAL PRIMARY KEY,
-            symbol VARCHAR(20) NOT NULL,
-            action VARCHAR(10) NOT NULL,
-            entry_price DECIMAL(20, 8) NOT NULL,
-            exit_price DECIMAL(20, 8),
-            position_size DECIMAL(20, 8) NOT NULL,
-            pnl DECIMAL(20, 8),
-            confidence DECIMAL(5, 2) NOT NULL,
-            reason TEXT,
-            timestamp TIMESTAMP NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        # Tabela de performance
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS performance (
-            id SERIAL PRIMARY KEY,
-            symbol VARCHAR(20) NOT NULL,
-            total_trades INTEGER NOT NULL,
-            winning_trades INTEGER NOT NULL,
-            losing_trades INTEGER NOT NULL,
-            win_rate DECIMAL(5, 2) NOT NULL,
-            total_pnl DECIMAL(20, 8) NOT NULL,
-            average_pnl DECIMAL(20, 8) NOT NULL,
-            best_trade DECIMAL(20, 8) NOT NULL,
-            worst_trade DECIMAL(20, 8) NOT NULL,
-            period_start TIMESTAMP NOT NULL,
-            period_end TIMESTAMP NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        # Tabela de configurações
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS configurations (
-            id SERIAL PRIMARY KEY,
-            key VARCHAR(50) NOT NULL UNIQUE,
-            value JSONB NOT NULL,
-            description TEXT,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        # Tabela de logs
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS logs (
-            id SERIAL PRIMARY KEY,
-            level VARCHAR(10) NOT NULL,
-            message TEXT NOT NULL,
-            details JSONB,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """)
-        
-        # Índices
-        cur.execute("""
-        CREATE INDEX IF NOT EXISTS idx_trades_symbol ON trades(symbol);
-        CREATE INDEX IF NOT EXISTS idx_trades_timestamp ON trades(timestamp);
-        CREATE INDEX IF NOT EXISTS idx_performance_symbol ON performance(symbol);
-        CREATE INDEX IF NOT EXISTS idx_performance_period ON performance(period_start, period_end);
-        CREATE INDEX IF NOT EXISTS idx_logs_level ON logs(level);
-        CREATE INDEX IF NOT EXISTS idx_logs_created_at ON logs(created_at);
-        """)
-        
-        # Função para atualizar updated_at
-        cur.execute("""
-        CREATE OR REPLACE FUNCTION update_updated_at_column()
-        RETURNS TRIGGER AS $$
-        BEGIN
-            NEW.updated_at = CURRENT_TIMESTAMP;
-            RETURN NEW;
-        END;
-        $$ language 'plpgsql';
-        """)
-        
-        # Triggers para atualizar updated_at
-        cur.execute("""
-        CREATE TRIGGER update_trades_updated_at
-            BEFORE UPDATE ON trades
-            FOR EACH ROW
-            EXECUTE FUNCTION update_updated_at_column();
+    while attempt <= max_attempts:
+        try:
+            logger.info(f"🔄 Migration attempt {attempt}/{max_attempts}")
             
-        CREATE TRIGGER update_configurations_updated_at
-            BEFORE UPDATE ON configurations
-            FOR EACH ROW
-            EXECUTE FUNCTION update_updated_at_column();
-        """)
-        
-        conn.commit()
-        logger.info("Database tables created successfully")
-        
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Error creating tables: {str(e)}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-def insert_initial_configurations():
-    """
-    Insere configurações iniciais no banco de dados.
-    """
-    conn = get_db_connection()
-    cur = conn.cursor()
-    
-    try:
-        # Configurações de trading
-        cur.execute("""
-        INSERT INTO configurations (key, value, description)
-        VALUES 
-            ('trading_pairs', '["BTCUSDT", "ETHUSDT"]', 'Lista de pares de trading'),
-            ('timeframe', '"1h"', 'Timeframe padrão'),
-            ('stop_loss', '{"strategy": "atr", "atr_period": 14, "atr_multiplier": 2.0}', 'Configurações de stop loss'),
-            ('risk_management', '{"max_position_size": 0.1, "max_drawdown": 0.05}', 'Configurações de gestão de risco')
-        ON CONFLICT (key) DO UPDATE
-        SET value = EXCLUDED.value,
-            updated_at = CURRENT_TIMESTAMP
-        """)
-        
-        conn.commit()
-        logger.info("Initial configurations inserted successfully")
-        
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"Error inserting configurations: {str(e)}")
-        raise
-    finally:
-        cur.close()
-        conn.close()
-
-def migrate_from_duckdb():
-    """
-    Migra dados do DuckDB para o PostgreSQL.
-    """
-    import duckdb
-    
-    duck_conn = duckdb.connect('data/trades.duckdb')
-    pg_conn = get_db_connection()
-    pg_cur = pg_conn.cursor()
-    
-    try:
-        # Migra trades
-        trades = duck_conn.execute("SELECT * FROM trades").fetchall()
-        if trades:
-            pg_cur.executemany("""
-                INSERT INTO trades (
-                    symbol, action, entry_price, exit_price,
-                    position_size, pnl, confidence, reason, timestamp
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, trades)
-        
-        # Migra estatísticas
-        stats = duck_conn.execute("SELECT * FROM trade_stats").fetchall()
-        if stats:
-            pg_cur.executemany("""
-                INSERT INTO performance (
-                    symbol, total_trades, winning_trades, losing_trades,
-                    win_rate, total_pnl, average_pnl, best_trade, worst_trade,
-                    period_start, period_end
-                ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            """, stats)
-        
-        pg_conn.commit()
-        logger.info("Data migration completed successfully")
-        
-    except Exception as e:
-        pg_conn.rollback()
-        logger.error(f"Error during migration: {str(e)}")
-        raise
-    finally:
-        duck_conn.close()
-        pg_cur.close()
-        pg_conn.close()
+            # Get database connection
+            pool = await get_db_connection()
+            if not pool:
+                raise Exception("Failed to get database connection")
+            
+            # Create tables
+            success = await create_tables()
+            if not success:
+                raise Exception("Failed to create tables")
+            
+            logger.info("✅ Database migrations completed successfully")
+            return True
+            
+        except Exception as e:
+            logger.warning(f"⚠️ Migration attempt {attempt} failed: {str(e)}")
+            attempt += 1
+            if attempt <= max_attempts:
+                logger.info(f"⏳ Waiting 2 seconds before next attempt...")
+                await asyncio.sleep(2)
+            else:
+                logger.error(f"❌ Failed to verify migrations after {max_attempts} attempts: {str(e)}")
+                return False
 
 if __name__ == "__main__":
-    try:
-        create_tables()
-        insert_initial_configurations()
-        migrate_from_duckdb()
-        logger.info("Database setup completed successfully")
-    except Exception as e:
-        logger.error(f"Database setup failed: {str(e)}")
-        sys.exit(1) 
+    asyncio.run(run_migrations()) 

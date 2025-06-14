@@ -2,7 +2,15 @@ from dataclasses import dataclass
 import pandas as pd
 import numpy as np
 import logging
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
+from datetime import datetime
+import asyncio
+from ..exchanges.order_manager import OrderManager, OrderConfig
+from ..config.settings import (
+    STOP_LOSS_PERCENT,
+    TAKE_PROFIT_PERCENT,
+    MARKET_TYPE
+)
 
 @dataclass
 class StopLossConfig:
@@ -18,10 +26,248 @@ class StopLossConfig:
 class StopLossManager:
     """Gerencia diferentes estratégias de stop loss."""
     
-    def __init__(self, config: StopLossConfig):
-        self.config = config
-        self.logger = logging.getLogger(__name__)
+    def __init__(self, order_manager: OrderManager):
+        self.order_manager = order_manager
+        self.logger = self._setup_logger()
+        self.active_stops: Dict[str, Dict] = {}
         
+    def _setup_logger(self) -> logging.Logger:
+        """Configura logger"""
+        logger = logging.getLogger('StopLossManager')
+        logger.setLevel(logging.INFO)
+        
+        if not logger.handlers:
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            
+        return logger
+        
+    async def setup_stop_loss(self, config: StopLossConfig) -> Dict:
+        """
+        Configura stop loss para uma posição
+        
+        Args:
+            config: Configuração do stop loss
+            
+        Returns:
+            Dict com informações do stop loss
+        """
+        try:
+            # Calcula preços se não fornecidos
+            if not config.stop_loss_price:
+                if config.side == 'buy':
+                    config.stop_loss_price = config.entry_price * (
+                        1 - STOP_LOSS_PERCENT
+                    )
+                else:
+                    config.stop_loss_price = config.entry_price * (
+                        1 + STOP_LOSS_PERCENT
+                    )
+                    
+            if not config.take_profit_price:
+                if config.side == 'buy':
+                    config.take_profit_price = config.entry_price * (
+                        1 + TAKE_PROFIT_PERCENT
+                    )
+                else:
+                    config.take_profit_price = config.entry_price * (
+                        1 - TAKE_PROFIT_PERCENT
+                    )
+                    
+            # Cria ordem de stop loss
+            sl_config = OrderConfig(
+                symbol=config.symbol,
+                side='sell' if config.side == 'buy' else 'buy',
+                type='stop',
+                amount=config.amount,
+                stop_price=config.stop_loss_price
+            )
+            
+            sl_order = await self.order_manager.create_order(sl_config)
+            
+            # Cria ordem de take profit
+            tp_config = OrderConfig(
+                symbol=config.symbol,
+                side='sell' if config.side == 'buy' else 'buy',
+                type='limit',
+                amount=config.amount,
+                price=config.take_profit_price
+            )
+            
+            tp_order = await self.order_manager.create_order(tp_config)
+            
+            # Configura trailing stop se especificado
+            if config.trailing_stop:
+                await self._setup_trailing_stop(config)
+                
+            # Registra stops ativos
+            self.active_stops[sl_order['id']] = {
+                'symbol': config.symbol,
+                'side': config.side,
+                'amount': config.amount,
+                'entry_price': config.entry_price,
+                'stop_loss': sl_order,
+                'take_profit': tp_order,
+                'trailing_stop': config.trailing_stop,
+                'trailing_activation': config.trailing_activation,
+                'created_at': datetime.now()
+            }
+            
+            return {
+                'stop_loss': sl_order,
+                'take_profit': tp_order
+            }
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up stop loss: {str(e)}")
+            raise
+            
+    async def _setup_trailing_stop(self, config: StopLossConfig) -> None:
+        """Configura trailing stop"""
+        try:
+            # Calcula preço de ativação se não fornecido
+            if not config.trailing_activation:
+                if config.side == 'buy':
+                    config.trailing_activation = config.entry_price * (
+                        1 + config.trailing_stop
+                    )
+                else:
+                    config.trailing_activation = config.entry_price * (
+                        1 - config.trailing_stop
+                    )
+                    
+            # Cria ordem de trailing stop
+            trailing_config = OrderConfig(
+                symbol=config.symbol,
+                side='sell' if config.side == 'buy' else 'buy',
+                type='trailing_stop',
+                amount=config.amount,
+                stop_price=config.trailing_activation
+            )
+            
+            trailing_order = await self.order_manager.create_order(trailing_config)
+            
+            self.logger.info(
+                f"Trailing stop set for {config.symbol}: "
+                f"activation at {config.trailing_activation}, "
+                f"trailing by {config.trailing_stop}"
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error setting up trailing stop: {str(e)}")
+            raise
+            
+    async def update_stop_loss(
+        self,
+        stop_id: str,
+        new_stop_price: float
+    ) -> Dict:
+        """
+        Atualiza preço de stop loss
+        
+        Args:
+            stop_id: ID do stop loss
+            new_stop_price: Novo preço do stop
+            
+        Returns:
+            Dict com stop loss atualizado
+        """
+        try:
+            if stop_id not in self.active_stops:
+                raise ValueError(f"Stop loss {stop_id} not found")
+                
+            stop_info = self.active_stops[stop_id]
+            
+            # Cancela stop loss antigo
+            await self.order_manager.cancel_order(
+                stop_info['stop_loss']['id'],
+                stop_info['symbol']
+            )
+            
+            # Cria novo stop loss
+            sl_config = OrderConfig(
+                symbol=stop_info['symbol'],
+                side='sell' if stop_info['side'] == 'buy' else 'buy',
+                type='stop',
+                amount=stop_info['amount'],
+                stop_price=new_stop_price
+            )
+            
+            new_sl = await self.order_manager.create_order(sl_config)
+            
+            # Atualiza registro
+            self.active_stops[stop_id]['stop_loss'] = new_sl
+            
+            self.logger.info(
+                f"Stop loss updated for {stop_info['symbol']}: "
+                f"new price {new_stop_price}"
+            )
+            
+            return new_sl
+            
+        except Exception as e:
+            self.logger.error(f"Error updating stop loss: {str(e)}")
+            raise
+            
+    async def cancel_stop_loss(self, stop_id: str) -> None:
+        """
+        Cancela stop loss
+        
+        Args:
+            stop_id: ID do stop loss
+        """
+        try:
+            if stop_id not in self.active_stops:
+                raise ValueError(f"Stop loss {stop_id} not found")
+                
+            stop_info = self.active_stops[stop_id]
+            
+            # Cancela stop loss e take profit
+            await self.order_manager.cancel_order(
+                stop_info['stop_loss']['id'],
+                stop_info['symbol']
+            )
+            
+            await self.order_manager.cancel_order(
+                stop_info['take_profit']['id'],
+                stop_info['symbol']
+            )
+            
+            # Remove registro
+            del self.active_stops[stop_id]
+            
+            self.logger.info(f"Stop loss cancelled for {stop_info['symbol']}")
+            
+        except Exception as e:
+            self.logger.error(f"Error cancelling stop loss: {str(e)}")
+            raise
+            
+    async def get_active_stops(self, symbol: Optional[str] = None) -> List[Dict]:
+        """
+        Obtém stops ativos
+        
+        Args:
+            symbol: Par de trading (opcional)
+            
+        Returns:
+            List[Dict] com stops ativos
+        """
+        try:
+            if symbol:
+                return [
+                    stop for stop in self.active_stops.values()
+                    if stop['symbol'] == symbol
+                ]
+            return list(self.active_stops.values())
+            
+        except Exception as e:
+            self.logger.error(f"Error getting active stops: {str(e)}")
+            raise
+    
     def calculate_stop_loss(self, 
                           symbol: str,
                           position_side: str,

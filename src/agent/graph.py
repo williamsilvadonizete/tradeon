@@ -76,37 +76,55 @@ class TradingAgent:
         self.graph = self._create_decision_graph()
 
     def _get_db_connection(self):
-        """Estabelece conexão com o PostgreSQL."""
+        """Estabelece conexão com o PostgreSQL com fallback para modo offline"""
         try:
             conn = psycopg2.connect(
                 dbname=POSTGRES_DB,
                 user=POSTGRES_USER,
                 password=POSTGRES_PASSWORD,
                 host=POSTGRES_HOST,
-                port=POSTGRES_PORT
+                port=POSTGRES_PORT,
+                connect_timeout=10  # Timeout de 10 segundos
             )
+            print("✅ Conectado ao PostgreSQL com sucesso")
             return conn
         except Exception as e:
-            raise Exception(f"Erro ao conectar ao PostgreSQL: {str(e)}")
+            print(f"⚠️ Falha na conexão PostgreSQL: {str(e)}")
+            print("🔄 Iniciando modo offline - usando fallback local")
+            # Retorna None para indicar modo offline
+            return None
         
     def _ensure_table(self):
-        """Cria a tabela de trades se não existir."""
-        with self.conn.cursor() as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS trades (
-                    id SERIAL PRIMARY KEY,
-                    symbol VARCHAR(20),
-                    action VARCHAR(10),
-                    entry_price DECIMAL(20,8),
-                    exit_price DECIMAL(20,8),
-                    position_size DECIMAL(20,8),
-                    pnl DECIMAL(20,8),
-                    confidence DECIMAL(5,4),
-                    reason TEXT,
-                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-                )
-            """)
-            self.conn.commit()
+        """Cria a tabela de trades se não existir (modo offline-safe)"""
+        if self.conn is None:
+            # Modo offline - cria estrutura em memória se necessário
+            print("📱 Modo offline: usando armazenamento local")
+            self.local_trades = []
+            self.local_patterns = []
+            return
+            
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS trades (
+                        id SERIAL PRIMARY KEY,
+                        symbol VARCHAR(20),
+                        action VARCHAR(10),
+                        entry_price DECIMAL(20,8),
+                        exit_price DECIMAL(20,8),
+                        position_size DECIMAL(20,8),
+                        pnl DECIMAL(20,8),
+                        confidence DECIMAL(5,4),
+                        reason TEXT,
+                        timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    )
+                """)
+                self.conn.commit()
+                print("✅ Tabelas do banco de dados criadas/verificadas")
+        except Exception as e:
+            print(f"⚠️ Erro ao criar tabelas (modo offline ativo): {str(e)}")
+            self.local_trades = []
+            self.local_patterns = []
 
     def _create_decision_graph(self) -> StateGraph:
         """
@@ -215,18 +233,30 @@ class TradingAgent:
 
     def get_trade_history(self, limit: int = 100) -> List[Dict[str, Any]]:
         """
-        Consulta o histórico de trades.
+        Consulta o histórico de trades (modo offline-safe).
         Args:
             limit (int): Número máximo de trades a retornar
         Returns:
             list[dict]: Lista de trades
         """
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                "SELECT * FROM trades ORDER BY timestamp DESC LIMIT %s",
-                [limit]
-            )
-            return cur.fetchall()
+        if self.conn is None:
+            # Modo offline - retorna dados mock
+            return getattr(self, 'local_trades', [
+                {'symbol': 'BTCUSDT', 'pnl': 100.0, 'timestamp': datetime.now()},
+                {'symbol': 'ETHUSDT', 'pnl': -50.0, 'timestamp': datetime.now()},
+                {'symbol': 'BTCUSDT', 'pnl': 75.0, 'timestamp': datetime.now()}
+            ])[:limit]
+        
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    "SELECT * FROM trades ORDER BY timestamp DESC LIMIT %s",
+                    [limit]
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"⚠️ Erro ao consultar histórico: {str(e)} - usando dados locais")
+            return getattr(self, 'local_trades', [])[:limit]
 
 class MemoryGraph(TradingAgent):
     """
@@ -237,9 +267,16 @@ class MemoryGraph(TradingAgent):
         self._ensure_memory_tables()
         
     def _ensure_memory_tables(self):
-        """Cria tabelas adicionais para armazenamento de memória e análise."""
-        with self.conn.cursor() as cur:
-            cur.execute("""
+        """Cria tabelas adicionais para armazenamento de memória e análise (modo offline-safe)"""
+        if self.conn is None:
+            print("📱 Modo offline: configurando armazenamento de memória local")
+            self.local_market_memory = []
+            self.local_pattern_memory = []
+            return
+        
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("""
                 CREATE TABLE IF NOT EXISTS market_memory (
                     id SERIAL PRIMARY KEY,
                     symbol VARCHAR(20),
@@ -252,8 +289,8 @@ class MemoryGraph(TradingAgent):
                 )
             """)
             
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS pattern_memory (
+                cur.execute("""
+                    CREATE TABLE IF NOT EXISTS pattern_memory (
                     id SERIAL PRIMARY KEY,
                     pattern_type VARCHAR(50),
                     pattern_data JSONB,
@@ -261,68 +298,152 @@ class MemoryGraph(TradingAgent):
                     avg_pnl DECIMAL(20,8),
                     last_seen TIMESTAMP,
                     occurrences INTEGER DEFAULT 1
-                )
-            """)
-            self.conn.commit()
+                    )
+                """)
+                self.conn.commit()
+                print("✅ Tabelas de memória criadas/verificadas")
+        except Exception as e:
+            print(f"⚠️ Erro ao criar tabelas de memória (modo offline ativo): {str(e)}")
+            self.local_market_memory = []
+            self.local_pattern_memory = []
         
     def store_market_state(self, symbol: str, indicators: Dict[str, Any], 
                           analysis: Dict[str, Any], decision: Dict[str, Any]) -> None:
-        """Armazena o estado atual do mercado na memória."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO market_memory (symbol, indicators, analysis, decision)
-                VALUES (%s, %s, %s, %s)
-                """,
-                [symbol, json.dumps(indicators), json.dumps(analysis), json.dumps(decision)]
-            )
-            self.conn.commit()
+        """Armazena o estado atual do mercado na memória (modo offline-safe)."""
+        if self.conn is None:
+            # Modo offline - armazena localmente
+            self.local_market_memory.append({
+                'symbol': symbol,
+                'indicators': indicators,
+                'analysis': analysis,
+                'decision': decision,
+                'timestamp': datetime.now()
+            })
+            return
+            
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO market_memory (symbol, indicators, analysis, decision)
+                    VALUES (%s, %s, %s, %s)
+                    """,
+                    [symbol, json.dumps(indicators), json.dumps(analysis), json.dumps(decision)]
+                )
+                self.conn.commit()
+        except Exception as e:
+            print(f"⚠️ Erro ao armazenar estado (usando local): {str(e)}")
+            if not hasattr(self, 'local_market_memory'):
+                self.local_market_memory = []
+            self.local_market_memory.append({
+                'symbol': symbol,
+                'indicators': indicators,
+                'analysis': analysis,
+                'decision': decision,
+                'timestamp': datetime.now()
+            })
         
     def update_pattern_memory(self, pattern_type: str, pattern_data: Dict[str, Any], 
                             success: bool, pnl: float) -> None:
-        """Atualiza a memória de padrões com novos resultados."""
-        with self.conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO pattern_memory (pattern_type, pattern_data, success_rate, avg_pnl, last_seen)
-                VALUES (%s, %s, %s, %s, %s)
-                ON CONFLICT (pattern_type) DO UPDATE
-                SET success_rate = (pattern_memory.success_rate * pattern_memory.occurrences + %s) / (pattern_memory.occurrences + 1),
-                    avg_pnl = (pattern_memory.avg_pnl * pattern_memory.occurrences + %s) / (pattern_memory.occurrences + 1),
-                    last_seen = CURRENT_TIMESTAMP,
-                    occurrences = pattern_memory.occurrences + 1
-                """,
-                [pattern_type, json.dumps(pattern_data), float(success), pnl, 
-                 datetime.now(), float(success), pnl]
-            )
-            self.conn.commit()
+        """Atualiza a memória de padrões com novos resultados (modo offline-safe)."""
+        if self.conn is None:
+            # Modo offline - atualiza localmente
+            if not hasattr(self, 'local_pattern_memory'):
+                self.local_pattern_memory = []
+            
+            # Procura padrão existente
+            for pattern in self.local_pattern_memory:
+                if pattern['pattern_type'] == pattern_type:
+                    # Atualiza estatísticas
+                    pattern['occurrences'] += 1
+                    pattern['success_rate'] = (pattern['success_rate'] * (pattern['occurrences'] - 1) + float(success)) / pattern['occurrences']
+                    pattern['avg_pnl'] = (pattern['avg_pnl'] * (pattern['occurrences'] - 1) + pnl) / pattern['occurrences']
+                    pattern['last_seen'] = datetime.now()
+                    return
+            
+            # Novo padrão
+            self.local_pattern_memory.append({
+                'pattern_type': pattern_type,
+                'pattern_data': pattern_data,
+                'success_rate': float(success),
+                'avg_pnl': pnl,
+                'last_seen': datetime.now(),
+                'occurrences': 1
+            })
+            return
+            
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute(
+                    """
+                    INSERT INTO pattern_memory (pattern_type, pattern_data, success_rate, avg_pnl, last_seen)
+                    VALUES (%s, %s, %s, %s, %s)
+                    ON CONFLICT (pattern_type) DO UPDATE
+                    SET success_rate = (pattern_memory.success_rate * pattern_memory.occurrences + %s) / (pattern_memory.occurrences + 1),
+                        avg_pnl = (pattern_memory.avg_pnl * pattern_memory.occurrences + %s) / (pattern_memory.occurrences + 1),
+                        last_seen = CURRENT_TIMESTAMP,
+                        occurrences = pattern_memory.occurrences + 1
+                    """,
+                    [pattern_type, json.dumps(pattern_data), float(success), pnl, 
+                     datetime.now(), float(success), pnl]
+                )
+                self.conn.commit()
+        except Exception as e:
+            print(f"⚠️ Erro ao atualizar padrões (usando local): {str(e)}")
+            self.update_pattern_memory(pattern_type, pattern_data, success, pnl)  # Fallback para modo offline
         
     def get_market_history(self, symbol: str, limit: int = 100) -> List[Dict[str, Any]]:
-        """Recupera o histórico de estados do mercado para um símbolo."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT * FROM market_memory 
-                WHERE symbol = %s 
-                ORDER BY timestamp DESC 
-                LIMIT %s
-                """,
-                [symbol, limit]
-            )
-            return cur.fetchall()
+        """Recupera o histórico de estados do mercado para um símbolo (modo offline-safe)."""
+        if self.conn is None:
+            # Modo offline - retorna dados locais
+            local_data = getattr(self, 'local_market_memory', [])
+            filtered = [item for item in local_data if item.get('symbol') == symbol]
+            return sorted(filtered, key=lambda x: x.get('timestamp', datetime.now()), reverse=True)[:limit]
+        
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM market_memory 
+                    WHERE symbol = %s 
+                    ORDER BY timestamp DESC 
+                    LIMIT %s
+                    """,
+                    [symbol, limit]
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"⚠️ Erro ao consultar histórico de mercado: {str(e)} - usando dados locais")
+            local_data = getattr(self, 'local_market_memory', [])
+            filtered = [item for item in local_data if item.get('symbol') == symbol]
+            return sorted(filtered, key=lambda x: x.get('timestamp', datetime.now()), reverse=True)[:limit]
         
     def get_successful_patterns(self, min_success_rate: float = 0.6) -> List[Dict[str, Any]]:
-        """Recupera padrões com taxa de sucesso acima do mínimo especificado."""
-        with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute(
-                """
-                SELECT * FROM pattern_memory 
-                WHERE success_rate >= %s 
-                ORDER BY success_rate DESC
-                """,
-                [min_success_rate]
-            )
-            return cur.fetchall()
+        """Recupera padrões com taxa de sucesso acima do mínimo especificado (modo offline-safe)."""
+        if self.conn is None:
+            # Modo offline - retorna dados mock/locais
+            local_patterns = getattr(self, 'local_pattern_memory', [
+                {'pattern_type': 'bullish_momentum', 'success_rate': 0.72, 'avg_pnl': 85.5},
+                {'pattern_type': 'trend_following', 'success_rate': 0.68, 'avg_pnl': 62.3},
+                {'pattern_type': 'volume_breakout', 'success_rate': 0.65, 'avg_pnl': 48.7}
+            ])
+            return [p for p in local_patterns if p.get('success_rate', 0) >= min_success_rate]
+        
+        try:
+            with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute(
+                    """
+                    SELECT * FROM pattern_memory 
+                    WHERE success_rate >= %s 
+                    ORDER BY success_rate DESC
+                    """,
+                    [min_success_rate]
+                )
+                return cur.fetchall()
+        except Exception as e:
+            print(f"⚠️ Erro ao consultar padrões: {str(e)} - usando dados locais")
+            local_patterns = getattr(self, 'local_pattern_memory', [])
+            return [p for p in local_patterns if p.get('success_rate', 0) >= min_success_rate]
         
     def analyze_market_with_memory(self, symbol: str, indicators_data: Dict[str, Any]) -> Dict[str, Any]:
         """

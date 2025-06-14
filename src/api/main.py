@@ -16,19 +16,39 @@ import json
 # Adiciona o diretório raiz ao path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
+# Configuração do logger (antes das importações)
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 from src.agent.worker import IntelligentTradingAgent
 from src.agent.graph import MemoryGraph
 from src.data.collector import DataCollector
 from config.settings import API_KEY
 
-# Configuração do logger
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+# Import dos novos endpoints superinteligentes
+try:
+    import sys
+    import os
+    # Adiciona o diretório raiz ao path para importação
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    project_root = os.path.dirname(os.path.dirname(current_dir))
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+    
+    from src.api.superintelligent_endpoints import router as superintelligent_router
+    SUPERINTELLIGENT_AVAILABLE = True
+    logger.info("✅ Superintelligent endpoints imported successfully")
+except ImportError as e:
+    logger.warning(f"❌ Superintelligent endpoints not available: {e}")
+    SUPERINTELLIGENT_AVAILABLE = False
+except Exception as e:
+    logger.error(f"❌ Error importing superintelligent endpoints: {e}")
+    SUPERINTELLIGENT_AVAILABLE = False
 
 app = FastAPI(
-    title="Crypto Trading Bot API",
-    description="API para consulta de dados do bot de trading",
-    version="1.0.0",
+    title="Superintelligent Crypto Trading Bot API",
+    description="API para consulta de dados do sistema superinteligente de trading",
+    version="2.0.0",
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_tags=[
@@ -39,6 +59,10 @@ app = FastAPI(
         {
             "name": "stats",
             "description": "Estatísticas e análises",
+        },
+        {
+            "name": "superintelligent",
+            "description": "Funcionalidades do sistema superinteligente",
         }
     ]
 )
@@ -64,6 +88,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Inclui routers dos endpoints superinteligentes
+logger.info(f"🔍 SUPERINTELLIGENT_AVAILABLE = {SUPERINTELLIGENT_AVAILABLE}")
+if SUPERINTELLIGENT_AVAILABLE:
+    try:
+        app.include_router(superintelligent_router, dependencies=[Depends(get_api_key)])
+        logger.info("✅ Superintelligent router included successfully")
+        logger.info(f"🔗 Router routes: {[route.path for route in superintelligent_router.routes]}")
+    except Exception as e:
+        logger.error(f"❌ Error including superintelligent router: {e}")
+        SUPERINTELLIGENT_AVAILABLE = False
+else:
+    logger.warning("❌ Superintelligent endpoints NOT loaded")
 
 # Conexão com o PostgreSQL
 def get_db_connection():
@@ -620,7 +657,7 @@ async def get_trading_statistics():
                 "month_pnl": 1203.45
             },
             "risk_metrics": {
-                "max_drawdown": -234.56,
+                "max_drawdown": 0.0,
                 "current_drawdown": -45.23,
                 "var_95": -89.34,
                 "expected_shortfall": -156.78
@@ -629,7 +666,7 @@ async def get_trading_statistics():
                 "trades_today": 3,
                 "trades_week": 18,
                 "trades_month": 67,
-                "avg_trade_size": 1234.56,
+                "avg_trade_size": 0.0,
                 "avg_holding_time": "2h 15m"
             }
         }

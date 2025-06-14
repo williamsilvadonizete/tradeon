@@ -136,7 +136,7 @@ class GateIOAdapter(ExchangeAdapter):
                 symbol = f"{base}/{quote}"
         
         return symbol
-    
+
     def set_futures_mode(self):
         """
         Configura o exchange para modo futures.
@@ -231,3 +231,6 @@ class GateIOAdapter(ExchangeAdapter):
         except Exception as e:
             self.logger.error(f"Error setting leverage: {str(e)}")
             raise
+
+# Alias for compatibility
+GateioExchange = GateIOAdapter
