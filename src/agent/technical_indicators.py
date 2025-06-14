@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from typing import List, Dict, Tuple, Optional
 import logging
-import talib
 import ta
 
 logger = logging.getLogger(__name__)
@@ -21,7 +20,8 @@ class TechnicalIndicators:
     def calculate_rsi(self, closes: List[float], period: int = 14) -> float:
         """Calculate RSI indicator."""
         try:
-            return talib.RSI(np.array(closes), timeperiod=period)[-1]
+            rsi = ta.momentum.RSIIndicator(close=pd.Series(closes), window=period)
+            return rsi.rsi().iloc[-1]
         except Exception as e:
             logger.error(f"Error calculating RSI: {str(e)}")
             return 50.0
@@ -29,7 +29,8 @@ class TechnicalIndicators:
     def calculate_sma(self, closes: List[float], period: int) -> float:
         """Calculate Simple Moving Average."""
         try:
-            return talib.SMA(np.array(closes), timeperiod=period)[-1]
+            sma = ta.trend.SMAIndicator(close=pd.Series(closes), window=period)
+            return sma.sma_indicator().iloc[-1]
         except Exception as e:
             logger.error(f"Error calculating SMA: {str(e)}")
             return closes[-1]
@@ -37,7 +38,8 @@ class TechnicalIndicators:
     def calculate_ema(self, closes: List[float], period: int) -> float:
         """Calculate Exponential Moving Average."""
         try:
-            return talib.EMA(np.array(closes), timeperiod=period)[-1]
+            ema = ta.trend.EMAIndicator(close=pd.Series(closes), window=period)
+            return ema.ema_indicator().iloc[-1]
         except Exception as e:
             logger.error(f"Error calculating EMA: {str(e)}")
             return closes[-1]
@@ -72,7 +74,13 @@ class TechnicalIndicators:
     def calculate_atr(self, highs: List[float], lows: List[float], closes: List[float], period: int = 14) -> float:
         """Calculate Average True Range."""
         try:
-            return talib.ATR(np.array(highs), np.array(lows), np.array(closes), timeperiod=period)[-1]
+            atr = ta.volatility.AverageTrueRange(
+                high=pd.Series(highs),
+                low=pd.Series(lows),
+                close=pd.Series(closes),
+                window=period
+            )
+            return atr.average_true_range().iloc[-1]
         except Exception as e:
             logger.error(f"Error calculating ATR: {str(e)}")
             return 0.0
@@ -80,7 +88,13 @@ class TechnicalIndicators:
     def calculate_volume_indicators(self, volumes: List[float], closes: List[float]) -> Tuple[float, float]:
         """Calculate volume indicators."""
         try:
-            volume_ma = talib.SMA(np.array(volumes), timeperiod=20)[-1]
+            volume_ma = ta.volume.VolumeWeightedAveragePrice(
+                high=pd.Series(closes),
+                low=pd.Series(closes),
+                close=pd.Series(closes),
+                volume=pd.Series(volumes),
+                window=20
+            ).volume_weighted_average_price().iloc[-1]
             momentum = (closes[-1] - closes[-2]) / closes[-2] if len(closes) > 1 else 0.0
             return volume_ma, momentum
         except Exception as e:
