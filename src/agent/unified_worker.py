@@ -111,16 +111,31 @@ class UnifiedIntelligentWorker:
         self.stop_loss_manager = StopLossManager(self.order_manager)
         self.technical_analysis = TechnicalAnalysisStrategy(self.order_manager, self.stop_loss_manager)
         
-        # OpenAI setup
-        self.openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
-        self.llm = ChatOpenAI(
-            model_name="gpt-4-turbo-preview",
-            temperature=0.7,
-            streaming=True
-        )
+        # OpenAI setup (with fallback)
+        if OPENAI_API_KEY:
+            try:
+                self.openai_client = openai.OpenAI(api_key=OPENAI_API_KEY)
+                self.llm = ChatOpenAI(
+                    model_name="gpt-4-turbo-preview",
+                    temperature=0.7,
+                    streaming=True
+                )
+                self.logger.info("✅ OpenAI configured successfully")
+            except Exception as e:
+                self.logger.warning(f"⚠️ OpenAI setup failed: {e}")
+                self.openai_client = None
+                self.llm = None
+        else:
+            self.logger.warning("⚠️ OPENAI_API_KEY not configured, AI analysis disabled")
+            self.openai_client = None
+            self.llm = None
         
         # Análise workflow
-        self.workflow = self._create_analysis_workflow()
+        try:
+            self.workflow = self._create_analysis_workflow()
+        except Exception as e:
+            self.logger.error(f"Error creating workflow: {e}")
+            self.workflow = None
         
         # Trading state
         self.positions = {}
@@ -303,7 +318,7 @@ class UnifiedIntelligentWorker:
         finally:
             self.state = AgentState.ACTIVE
     
-    async def _create_analysis_workflow(self) -> StateGraph:
+    def _create_analysis_workflow(self):
         """Create the analysis workflow using LangGraph."""
         workflow = StateGraph(AnalysisState)
         
@@ -390,6 +405,13 @@ class UnifiedIntelligentWorker:
     async def _analyze_market(self, state: AnalysisState) -> AnalysisState:
         """Analyze market conditions using OpenAI."""
         try:
+            if not self.llm:
+                self.logger.warning("OpenAI not available, skipping market analysis")
+                state["analysis"] = {
+                    "market_analysis": "AI analysis not available",
+                    "timestamp": datetime.now().isoformat()
+                }
+                return state
             # Prepare market analysis prompt
             prompt = ChatPromptTemplate.from_messages([
                 SystemMessage(content="""You are an expert crypto market analyst. 
@@ -435,6 +457,27 @@ class UnifiedIntelligentWorker:
     async def _make_decision(self, state: AnalysisState) -> AnalysisState:
         """Make trading decision based on analysis."""
         try:
+            if not self.llm:
+                self.logger.warning("OpenAI not available, using basic decision logic")
+                # Basic decision based on RSI
+                rsi = state["indicators"]["rsi"]
+                if rsi < 30:
+                    action = "buy"
+                    confidence = 0.6
+                elif rsi > 70:
+                    action = "sell"
+                    confidence = 0.6
+                else:
+                    action = "hold"
+                    confidence = 0.3
+                
+                state["decision"] = {
+                    "action": action,
+                    "confidence": confidence,
+                    "reasoning": f"Basic RSI-based decision: RSI={rsi:.2f}",
+                    "timestamp": datetime.now().isoformat()
+                }
+                return state
             # Prepare decision prompt
             prompt = ChatPromptTemplate.from_messages([
                 SystemMessage(content="""You are an expert crypto trader. 
